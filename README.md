@@ -11,4 +11,4 @@ shyun_app_user -targettype <githubpath> -playbookpath /opt/splunk-deployer/wm-sp
 ```
 
 
-AUthor: Sriram Kaushik
+Author: Sriram Kaushik
