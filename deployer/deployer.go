@@ -5,6 +5,7 @@ AUTHOR: SRIRAM KAUSHIK
 package deployer
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -12,19 +13,78 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
 )
 
+type Inputs struct {
+	Log_file_path           *string
+	Ansible_playbook_path   *string
+	Ansible_playbook_action *string
+	Oneops_jar_path         *string
+	Ansible_tags            *string
+	Ansbile_skip_tags       *string
+	Target_type             *string
+	Ansible_user            *string
+	Hosts_limit             *string
+	Max_fail_percentage     *string
+	S1                      *string
+	S2                      *string
+	S3                      *string
+}
+
 type EnvVars struct {
-	OO_ORG      string
-	OO_PLATFORM string
-	OO_ASSEMBLY string
-	OO_ENV      string
+	OO_ORG          string
+	OO_PLATFORM     string
+	OO_ASSEMBLY     string
+	OO_ENV          string
+	TP_PROJECT      string
+	TP_DC           string
+	TP_ENV          string
+	IS_HOSTS_INI    bool
+	HOSTS_INI_LIMIT string
 }
 
 var EnvVarMap = make(map[string]EnvVars)
+
+func ExtractOneOpsVars(propfile string) (oo_org, oo_env, oo_platform, oo_assembly string, err error) {
+
+	//create some regex variables
+
+	var MatchOOOrg = regexp.MustCompile("^OO_ORG=.+")
+	var MatchOOAssembly = regexp.MustCompile("^OO_ASSEMBLY=.+")
+	var MatchOOPlatform = regexp.MustCompile("^OO_PLATFORM=.+")
+	var MatchOOEnv = regexp.MustCompile("^OO_ENV=.+")
+
+	//scan the deployment properties file to get all the oneops related configuration
+	filehandle, err := os.Open(propfile)
+
+	if err != nil {
+		return
+	}
+
+	defer filehandle.Close()
+
+	filescanner := bufio.NewScanner(filehandle)
+
+	for filescanner.Scan() {
+		switch true {
+		case MatchOOOrg.MatchString(filescanner.Text()):
+			oo_org = strings.Split(filescanner.Text(), "=")[1]
+		case MatchOOEnv.MatchString(filescanner.Text()):
+			oo_env = strings.Split(filescanner.Text(), "=")[1]
+		case MatchOOAssembly.MatchString(filescanner.Text()):
+			oo_assembly = strings.Split(filescanner.Text(), "=")[1]
+		case MatchOOPlatform.MatchString(filescanner.Text()):
+			oo_platform = strings.Split(filescanner.Text(), "=")[1]
+		}
+	}
+
+	//return will return all the variables for this function
+	return
+}
 
 func PopulateHash(path string, fp os.FileInfo, err error) error {
 	if fp.IsDir() {
@@ -35,22 +95,46 @@ func PopulateHash(path string, fp os.FileInfo, err error) error {
 		return nil
 	}
 
-	tmp := strings.Split(path, "/")
+	switch filename := fp.Name(); filename {
 
-	tmp_oo_env := tmp[len(tmp)-2]
-	tmp_oo_platform := tmp[len(tmp)-3]
-	tmp_oo_assembly := tmp[len(tmp)-4]
-	tmp_oo_org := tmp[len(tmp)-5]
+	case "deployment.properties":
 
-	key := tmp_oo_org + "_" + tmp_oo_assembly + "_" + tmp_oo_platform + "_" + tmp_oo_env
+		tmp := strings.Split(path, "/")
+		tmp_tp_env := tmp[len(tmp)-2]
+		tmp_tp_dc := tmp[len(tmp)-3]
+		tmp_tp_project := tmp[len(tmp)-4]
 
-	//This hash generates a key which is the folder path. Using an integer or incrementing count will result in duplicate keys for each file (inputs.yml, outputs.yml) in dest
+		tmp_oo_org, tmp_oo_env, tmp_oo_platform, tmp_oo_assembly, err := ExtractOneOpsVars(path)
 
-	EnvVarMap[key] = EnvVars{tmp_oo_org, tmp_oo_platform, tmp_oo_assembly, tmp_oo_env}
-	return nil
+		if err != nil {
+			return err
+		}
+		key := tmp_oo_org + "_" + tmp_oo_assembly + "_" + tmp_oo_platform + "_" + tmp_oo_env + "_" + tmp_tp_env + "_" + tmp_tp_dc + "_" + tmp_tp_project
+
+		//This hash generates a key which is the folder path. Using an integer or incrementing count will result in duplicate keys for each file (inputs.yml, outputs.yml) in dest
+		//********* add a check if any key element in empty don't process it. *********
+
+		EnvVarMap[key] = EnvVars{OO_ORG: tmp_oo_org, OO_PLATFORM: tmp_oo_platform, OO_ASSEMBLY: tmp_oo_assembly, OO_ENV: tmp_oo_env, TP_PROJECT: tmp_tp_project, TP_DC: tmp_tp_dc, TP_ENV: tmp_tp_env}
+		return nil
+
+	case "hosts.ini":
+
+		tmp := strings.Split(path, "/")
+		tmp_tp_env := tmp[len(tmp)-2]
+		tmp_tp_dc := tmp[len(tmp)-3]
+		tmp_tp_project := tmp[len(tmp)-4]
+
+		key := "hostsini_" + tmp_tp_env + "_" + tmp_tp_dc + "_" + tmp_tp_project
+		EnvVarMap[key] = EnvVars{TP_PROJECT: tmp_tp_project, TP_DC: tmp_tp_dc, TP_ENV: tmp_tp_env, IS_HOSTS_INI: true}
+		return nil
+	default:
+		return nil
+
+	}
+
 }
 
-func ExtractEnvVars(target_type, ansible_playbook_path *string, logfile *os.File) map[string]EnvVars {
+func ExtractEnvVars(inputs *Inputs, logfile *os.File) map[string]EnvVars {
 
 	log.SetOutput(logfile)
 
@@ -58,7 +142,7 @@ func ExtractEnvVars(target_type, ansible_playbook_path *string, logfile *os.File
 
 	//add a validator to check root_dir variable (the path) if files exists underneath else return here. If path doesn't exist then we will get a nil pointer exception.
 
-	root_dir := (*ansible_playbook_path) + "/vars/conf/" + (*target_type)
+	root_dir := *inputs.Ansible_playbook_path + "/" + *inputs.Target_type //can do just inputs.Target_type. But this is just to better readability
 
 	err := filepath.Walk(root_dir, PopulateHash)
 
@@ -66,13 +150,13 @@ func ExtractEnvVars(target_type, ansible_playbook_path *string, logfile *os.File
 		log.Fatal("ERROR: Could not map assembly/platform/env together. Check the hierarchy")
 	}
 
-	//I have to return map[int]EnvVars because I can't pass a pointer to PopulateHash function. This will have some perf issues.
+	//maps are passed as references.
 
 	return EnvVarMap
 
 }
 
-func Deploy(map_list *map[string]EnvVars, playbook_path, playbook_action, jar_path *string, logfile *os.File, logdir *string, OO_API_TOKEN string) error {
+func Deploy(map_list *map[string]EnvVars, inputs *Inputs, logfile *os.File, OO_API_TOKEN string) error {
 	log.SetOutput(logfile)
 	var proccessed chan string
 
@@ -84,7 +168,7 @@ func Deploy(map_list *map[string]EnvVars, playbook_path, playbook_action, jar_pa
 
 	for filename, envvariables := range *map_list {
 
-		go RunAnsible(logdir, logfile, playbook_action, playbook_path, jar_path, filename, OO_API_TOKEN, envvariables.OO_ORG, envvariables.OO_ASSEMBLY, envvariables.OO_ENV, envvariables.OO_PLATFORM, proccessed)
+		go RunAnsible(inputs, logfile, filename, OO_API_TOKEN, envvariables.OO_ORG, envvariables.OO_ASSEMBLY, envvariables.OO_ENV, envvariables.OO_PLATFORM, envvariables.TP_PROJECT, envvariables.TP_DC, envvariables.TP_ENV, envvariables.IS_HOSTS_INI, proccessed)
 
 	}
 
@@ -99,18 +183,24 @@ func Deploy(map_list *map[string]EnvVars, playbook_path, playbook_action, jar_pa
 }
 
 //This function will run a multiple GOROUTINES
-func RunAnsible(logdir *string, logfile *os.File, playbook_action, playbook_path, jar_path *string, assembly_file, OO_API_TOKEN, OO_ORG, OO_ASSEMBLY, OO_ENV, OO_PLATFORM string, proccessed chan string) {
+func RunAnsible(inputs *Inputs, logfile *os.File, assembly_file, OO_API_TOKEN, OO_ORG, OO_ASSEMBLY, OO_ENV, OO_PLATFORM, TP_PROJECT, TP_DC, TP_ENV string, is_hosts_ini bool, proccessed chan string) {
 	log.SetOutput(logfile)
 	//45 minute timeout.
 	ctx, cancel := context.WithTimeout(context.Background(), 3100*time.Second)
 	defer cancel()
 
-	playbook_to_run := (*playbook_path) + "/" + "tasks/" + (*playbook_action)
+	playbook_to_run := *inputs.Ansible_playbook_path + "/" + *inputs.Ansible_playbook_action
 
 	//we need to modify the OO_PLATFORM as the oneops jar expects -l arguement as platform-<actual platformname>-compute.
-	L_OO_PLATFORM := "platform-" + OO_PLATFORM + "-compute"
+	var L_OO_PLATFORM string
 
-	cmd := exec.CommandContext(ctx, "ansible-playbook", "-l", L_OO_PLATFORM, "--user=app", "-i", *jar_path, playbook_to_run, "--extra-vars", "OO_ORG="+OO_ORG+" OO_ASSEMBLY="+OO_ASSEMBLY+" OO_PLATFORM="+OO_PLATFORM+" OO_ENV="+OO_ENV+"")
+	if !is_hosts_ini {
+		L_OO_PLATFORM = "platform-" + OO_PLATFORM + "-compute"
+	} else {
+		L_OO_PLATFORM = *inputs.Hosts_limit
+	}
+
+	cmd := exec.CommandContext(ctx, "ansible-playbook", "-l", L_OO_PLATFORM, "-u", *inputs.Ansible_user, "-i", *inputs.Oneops_jar_path, playbook_to_run, "--tags", *inputs.Ansible_tags, "--skip-tags", *inputs.Ansbile_skip_tags, "--extra-vars", "project="+TP_PROJECT+" data_center="+TP_DC+" env="+TP_ENV+" ans_max_fail_percent="+*inputs.Max_fail_percentage+" s1="+*inputs.S1+" s2="+*inputs.S2+" s3="+*inputs.S3+"")
 	env := os.Environ()
 
 	env = append(env, fmt.Sprintf("OO_API_TOKEN=%s", OO_API_TOKEN), fmt.Sprintf("OO_ORG=%s", OO_ORG), fmt.Sprintf("OO_ASSEMBLY=%s", OO_ASSEMBLY), fmt.Sprintf("OO_ENV=%s", OO_ENV), fmt.Sprintf("OO_ENDPOINT=%s", "https://oneops.prod.walmart.com/"), fmt.Sprintf("ANSIBLE_HOST_KEY_CHECKING=%s", "False"))
@@ -120,7 +210,7 @@ func RunAnsible(logdir *string, logfile *os.File, playbook_action, playbook_path
 
 	// create a output file.
 
-	outfile, err := os.Create((*logdir) + "/" + assembly_file + ".output")
+	outfile, err := os.Create((*inputs.Log_file_path) + "/" + assembly_file + ".output")
 	if err != nil {
 		log.Fatal("Error: Unable to Create output file but I will still proceed")
 	}
